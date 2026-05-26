@@ -75,11 +75,80 @@ jobs:
           find "assets/${JOB_ID}" -size -1k -delete 2>/dev/null || true
 
           echo "=== Voice ==="; ls -la "assets/${JOB_ID}/voice/" 2>/dev/null
-          echo "=== Images ==="; ls -la "assets/${JOB_ID}/images/" 2>/dev/null
-          IMG_CNT=$(ls assets/${JOB_ID}/images/*.png 2>/dev/null | wc -l)
-          echo "Image count: $IMG_CNT"
           echo "=== Characters ==="; ls -la "assets/${JOB_ID}/characters/" 2>/dev/null
           echo "=== Music ==="; ls -la "assets/${JOB_ID}/music/" 2>/dev/null
+
+      # ===========================================================
+      # 2.5 GENERATE IMAGES PARALLEL DARI POLLINATIONS
+      # PHP cuma kirim prompt list, GitHub Actions yang generate (parallel)
+      # ===========================================================
+      - name: Generate scene images parallel from Pollinations
+        env:
+          JOB_ID: ${{ inputs.job_id }}
+        run: |
+          set -e
+          cd "assets/${JOB_ID}"
+          mkdir -p images
+
+          PROMPT_COUNT=$(jq '.image_prompts | length // 0' manifest.json)
+          echo "Total image prompts: $PROMPT_COUNT"
+
+          if [ "$PROMPT_COUNT" -eq 0 ]; then
+            echo "⚠️  No image prompts in manifest, skip image gen"
+            exit 0
+          fi
+
+          ASPECT=$(jq -r '.aspect // "16:9"' manifest.json)
+          if [ "$ASPECT" = "9:16" ]; then
+            IMG_W=720; IMG_H=1280
+          elif [ "$ASPECT" = "1:1" ]; then
+            IMG_W=1024; IMG_H=1024
+          else
+            IMG_W=1024; IMG_H=576
+          fi
+          echo "Image resolution: ${IMG_W}x${IMG_H} (aspect $ASPECT)"
+
+          NEG="cropped body, half body, close-up face, portrait shot, headshot, text, letters, words, speech bubbles, watermark, signature, logo, blurry, low quality, multiple people, extra characters, realistic photo"
+          NEG_ENC=$(printf '%s' "$NEG" | jq -sRr @uri)
+
+          # Build URL list
+          > image-urls.txt
+          for i in $(seq 0 $((PROMPT_COUNT-1))); do
+            FILENAME=$(jq -r ".image_prompts[$i].filename" manifest.json)
+            PROMPT=$(jq -r ".image_prompts[$i].prompt" manifest.json)
+            SEED=$(jq -r ".image_prompts[$i].seed" manifest.json)
+            PROMPT_ENC=$(printf '%s' "$PROMPT" | jq -sRr @uri)
+            URL="https://image.pollinations.ai/prompt/${PROMPT_ENC}?width=${IMG_W}&height=${IMG_H}&nologo=true&enhance=false&model=flux&seed=${SEED}&negative_prompt=${NEG_ENC}"
+            printf '%s\t%s\n' "$URL" "images/${FILENAME}" >> image-urls.txt
+          done
+
+          echo "Downloading ${PROMPT_COUNT} images in parallel (8 concurrent)..."
+
+          # Parallel download — 8 concurrent
+          while IFS=$'\t' read -r URL OUT; do
+            (
+              curl -sL -m 90 --connect-timeout 15 \
+                -H "Accept: image/png,image/jpeg" \
+                -A "Nybelic-Content-Auto/1.0" \
+                -o "$OUT" "$URL" 2>/dev/null \
+                && echo "  ✓ $OUT ($(stat -c%s "$OUT" 2>/dev/null || echo 0) bytes)" \
+                || echo "  ✗ $OUT FAILED"
+            ) &
+            # Limit concurrency to 8
+            while [ "$(jobs -r | wc -l)" -ge 8 ]; do sleep 0.5; done
+          done < image-urls.txt
+          wait
+
+          # Cleanup file kecil/404
+          find images/ -size -5k -delete 2>/dev/null || true
+
+          IMG_OK=$(ls images/*.png 2>/dev/null | wc -l)
+          echo ""
+          echo "Generated images: ${IMG_OK} / ${PROMPT_COUNT}"
+          if [ "$IMG_OK" -eq 0 ]; then
+            echo "❌ ALL IMAGE GEN FAILED"
+            exit 1
+          fi
 
       # ===========================================================
       # 3. RENDER PER-DIALOG (Kok-Bisa style)
