@@ -116,31 +116,41 @@ jobs:
 
           # ===========================================================
           # 3.1 Pre-process: re-encode all MP3 ke 44100Hz stereo 128k
+          # (skip kalau gagal, original tetap dipakai)
           # ===========================================================
           mkdir -p voice/fixed
+          REENCODE_OK=0
+          REENCODE_SKIP=0
           for mp3 in $(ls voice/*.mp3 2>/dev/null | grep -v "/fixed/"); do
             DUR=$(ffprobe -v error -analyzeduration 5000000 -probesize 5000000 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp3" 2>/dev/null || echo "0")
             VALID=$(echo "$DUR > 0.1" | bc 2>/dev/null || echo 0)
-            if [ "$VALID" = "1" ]; then
-              FIXED="voice/fixed/$(basename "$mp3")"
-              ffmpeg -y -analyzeduration 5000000 -probesize 5000000 -i "$mp3" \
-                -ar 44100 -ac 2 -b:a 128k -c:a libmp3lame "$FIXED" 2>/dev/null && \
-                cp "$FIXED" "$mp3" || echo "Re-encode failed: $mp3"
-            else
+            if [ "$VALID" != "1" ]; then
               echo "⚠️  Removing corrupt MP3: $mp3 (dur=$DUR)"
               rm -f "$mp3"
+              continue
+            fi
+            FIXED="voice/fixed/$(basename "$mp3")"
+            if ffmpeg -y -analyzeduration 5000000 -probesize 5000000 -i "$mp3" \
+                -ar 44100 -ac 2 -b:a 128k -c:a libmp3lame "$FIXED" 2>/dev/null; then
+              cp -f "$FIXED" "$mp3"
+              REENCODE_OK=$((REENCODE_OK+1))
+            else
+              REENCODE_SKIP=$((REENCODE_SKIP+1))
             fi
           done
+          echo "Re-encode: ok=$REENCODE_OK skip=$REENCODE_SKIP (skip pakai original)"
 
           # ===========================================================
           # 3.2 Build TITLE CARD (3 detik intro)
           # ===========================================================
-          # Solid gradient background + judul gede + channel handle
+          # Pakai textfile supaya aman dari karakter khusus
+          printf '%s' "$TITLE" > title_text.txt
+          printf '@%s' "$CHANNEL" > channel_text.txt
+          printf '%s' "$WEBSITE" > website_text.txt
+
           ffmpeg -y \
             -f lavfi -i "gradients=size=${W}x${H}:duration=3:speed=0.05:c0=0x${BRAND_PRIMARY}:c1=0x${BRAND_SECONDARY}:c2=0x${BRAND_ACCENT}:r=${FPS}" \
-            -vf "drawtext=text='${TITLE}':fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=white:borderw=6:bordercolor=black\@0.5:x=(w-text_w)/2:y=(h-text_h)/2-60:line_spacing=15,
-                 drawtext=text='@${CHANNEL}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=white\@0.85:x=(w-text_w)/2:y=(h-text_h)/2+80,
-                 drawtext=text='${WEBSITE}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=white\@0.7:x=(w-text_w)/2:y=h-100" \
+            -vf "drawtext=textfile=title_text.txt:fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=white:borderw=6:bordercolor=black@0.5:x=(w-text_w)/2:y=(h-text_h)/2-60:line_spacing=15,drawtext=textfile=channel_text.txt:fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=white@0.85:x=(w-text_w)/2:y=(h-text_h)/2+80,drawtext=textfile=website_text.txt:fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=white@0.7:x=(w-text_w)/2:y=h-100" \
             -t 3 -c:v libx264 -pix_fmt yuv420p -preset fast title_card.mp4
 
           # Silent audio untuk title card
@@ -174,7 +184,9 @@ jobs:
               EMO=$(echo "$D" | jq -r '.emotion // "talking"')
               POSE_FN=$(echo "$D" | jq -r '.pose_file // ""')
               VOICE_FN=$(echo "$D" | jq -r '.voice_file // ""')
-              CAPTION=$(echo "$D" | jq -r '.caption // ""' | head -c 200 | sed "s/['\"\\\\:]//g")
+              CAPTION=$(echo "$D" | jq -r '.caption // ""' | tr -d '\n\r' | head -c 250 | sed 's/[\\:]//g')
+              # Word-wrap caption ke max 50 char per line untuk readable subtitle
+              CAPTION=$(echo "$CAPTION" | fold -s -w 50 | awk '{printf "%s%s", $0, (NR<=2 ? "\n" : "")}' | head -c 200)
               WORD_COUNT=$(echo "$CAPTION" | wc -w)
 
               VOICE_PATH="voice/${VOICE_FN}"
@@ -283,11 +295,15 @@ jobs:
                 CAP_Y=$((H - SUB_HEIGHT + 80))
                 NAME_Y=$((H - SUB_HEIGHT + 20))
 
+                # Save caption + name tag ke file (avoid shell-escape hell)
+                printf '%s' "$CAPTION" > caption_${shotIdx}.txt
+                printf '%s' "$NAME_TAG" > nametag_${shotIdx}.txt
+
                 FILTER="[1:v]scale=${FB_W}:-1[fb_raw];[fb_raw]format=rgba,colorchannelmixer=aa=1.0[fb];"
                 FILTER="${FILTER}[0:v][fb]overlay=x=${FB_X}:y='H-h+${FB_BOB}'[bg2];"
                 FILTER="${FILTER}[bg2]drawbox=x=0:y=${BOX_Y}:w=iw:h=${SUB_HEIGHT}:color=black@0.72:t=fill[boxed];"
-                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
-                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
+                FILTER="${FILTER}[boxed]drawtext=textfile=nametag_${shotIdx}.txt:fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
+                FILTER="${FILTER}[named]drawtext=textfile=caption_${shotIdx}.txt:fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
 
                 ffmpeg -y \
                   -i shot_bg_${shotIdx}.mp4 \
@@ -318,13 +334,17 @@ jobs:
                 CAP_Y=$((H - SUB_HEIGHT + 80))
                 NAME_Y=$((H - SUB_HEIGHT + 20))
 
+                # Save caption + name tag ke file
+                printf '%s' "$CAPTION" > caption_${shotIdx}.txt
+                printf '%s' "$NAME_TAG" > nametag_${shotIdx}.txt
+
                 FILTER="[1:v]scale=${CHAR_W}:-1[active_raw];[active_raw]format=rgba,colorchannelmixer=aa=1.0[active];"
                 FILTER="${FILTER}[2:v]scale=${CHAR_W}:-1[lst_raw];[lst_raw]format=rgba,colorchannelmixer=aa=0.55[listener];"
                 FILTER="${FILTER}[0:v][listener]overlay=x=${LISTENER_X}:y='${LISTENER_Y_EXPR}+${LISTENER_BOB}'[bg1];"
                 FILTER="${FILTER}[bg1][active]overlay=x=${ACTIVE_X}:y='${ACTIVE_Y_EXPR}+${ACTIVE_BOB}'[bg2];"
                 FILTER="${FILTER}[bg2]drawbox=x=0:y=${BOX_Y}:w=iw:h=${SUB_HEIGHT}:color=black@0.72:t=fill[boxed];"
-                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
-                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
+                FILTER="${FILTER}[boxed]drawtext=textfile=nametag_${shotIdx}.txt:fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
+                FILTER="${FILTER}[named]drawtext=textfile=caption_${shotIdx}.txt:fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
 
                 ffmpeg -y \
                   -i shot_bg_${shotIdx}.mp4 \
@@ -371,12 +391,17 @@ jobs:
 
           # CTA card: gradient + judul "Cek Psikotes" + URL gede + dua karakter pointing
           CHAR_W=$((W * CHAR_W_PCT / 100))
+          # CTA texts via files (avoid shell escaping)
+          printf 'Cek Psikotes Anda Sekarang' > cta_title.txt
+          printf '%s' "$WEBSITE" > cta_url.txt
+          printf '%s' "$CTA_TEXT" > cta_caption.txt
+
           ffmpeg -y \
             -f lavfi -i "gradients=size=${W}x${H}:duration=${CTA_DUR_INT}:speed=0.06:c0=0x${BRAND_PRIMARY}:c1=0x${BRAND_SECONDARY}:c2=0x${BRAND_ACCENT}:r=${FPS}" \
             -loop 1 -t $CTA_DUR_INT -i "$NYBEL_POINTING" \
             -loop 1 -t $CTA_DUR_INT -i "$NYBELIC_EXC" \
             -i "$CTA_VOICE" \
-            -filter_complex "[1:v]scale=${CHAR_W}:-1[n1];[2:v]scale=${CHAR_W}:-1[n2];[0:v][n1]overlay=x=40:y='H-h-30+8*sin(2*PI*t/0.5)'[a1];[a1][n2]overlay=x='W-w-40':y='H-h-30+8*sin(2*PI*t/0.5+1)'[a2];[a2]drawtext=text='Cek Psikotes Anda Sekarang':fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=white:borderw=5:bordercolor=black\@0.6:x=(w-text_w)/2:y=120,drawtext=text='${WEBSITE}':fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=0x${BRAND_ACCENT}:borderw=5:bordercolor=white\@0.8:x=(w-text_w)/2:y=240,drawtext=text='${CTA_TEXT}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:borderw=3:bordercolor=black\@0.5:x=(w-text_w)/2:y=380:line_spacing=12[v]" \
+            -filter_complex "[1:v]scale=${CHAR_W}:-1[n1];[2:v]scale=${CHAR_W}:-1[n2];[0:v][n1]overlay=x=40:y='H-h-30+8*sin(2*PI*t/0.5)'[a1];[a1][n2]overlay=x='W-w-40':y='H-h-30+8*sin(2*PI*t/0.5+1)'[a2];[a2]drawtext=textfile=cta_title.txt:fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=white:borderw=5:bordercolor=black@0.6:x=(w-text_w)/2:y=120,drawtext=textfile=cta_url.txt:fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=0x${BRAND_ACCENT}:borderw=5:bordercolor=white@0.8:x=(w-text_w)/2:y=240,drawtext=textfile=cta_caption.txt:fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:borderw=3:bordercolor=black@0.5:x=(w-text_w)/2:y=380:line_spacing=12[v]" \
             -map "[v]" -map 3:a \
             -c:v libx264 -pix_fmt yuv420p -preset fast \
             -c:a aac -b:a 128k \
@@ -397,15 +422,28 @@ jobs:
           # 3.6 Mix audio + background music (-25dB ducking)
           # ===========================================================
           BGM="music/bgm.mp3"
+          BGM_VALID=0
           if [ -f "$BGM" ]; then
+            # Validate BGM: cek apakah punya audio stream valid
+            BGM_DUR=$(ffprobe -v error -analyzeduration 5000000 -probesize 5000000 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$BGM" 2>/dev/null || echo "0")
+            BGM_CHANNELS=$(ffprobe -v error -analyzeduration 5000000 -probesize 5000000 -select_streams a:0 -show_entries stream=channels -of default=noprint_wrappers=1:nokey=1 "$BGM" 2>/dev/null || echo "0")
+            if [ "$(echo "$BGM_DUR > 0.5" | bc 2>/dev/null || echo 0)" = "1" ] && [ "$BGM_CHANNELS" -ge 1 ]; then
+              BGM_VALID=1
+              echo "✅ BGM valid: ${BGM_DUR}s, ${BGM_CHANNELS}ch"
+            else
+              echo "⚠️  BGM corrupt (dur=$BGM_DUR ch=$BGM_CHANNELS), skip music mixing"
+            fi
+          fi
+
+          if [ "$BGM_VALID" = "1" ]; then
             FINAL_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 final_video.mp4)
             FINAL_DUR_INT=$(printf "%.0f" "$FINAL_DUR")
-            ffmpeg -y -stream_loop -1 -i "$BGM" -t $FINAL_DUR_INT -af "volume=-25dB" bgm_loop.mp3
+            ffmpeg -y -stream_loop -1 -i "$BGM" -t $FINAL_DUR_INT -af "volume=-25dB" bgm_loop.mp3 2>/dev/null && \
             ffmpeg -y -i final_video.mp4 -i bgm_loop.mp3 \
               -filter_complex "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]" \
               -map 0:v -map "[aout]" \
               -c:v copy -c:a aac -b:a 192k \
-              "../../output/${JOB_ID}.mp4"
+              "../../output/${JOB_ID}.mp4" || cp final_video.mp4 "../../output/${JOB_ID}.mp4"
           else
             cp final_video.mp4 "../../output/${JOB_ID}.mp4"
           fi
