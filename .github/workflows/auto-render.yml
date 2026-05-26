@@ -1,0 +1,57 @@
+name: Auto Render Nybelic Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: 'Job ID'
+        required: true
+      format:
+        description: 'Format'
+        required: true
+        default: 'long'
+      assets_url:
+        description: 'Manifest URL'
+        required: true
+      callback_url:
+        description: 'Callback URL'
+        required: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Setup FFmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - name: Render placeholder video
+        run: |
+          mkdir -p output
+          JOB_ID="${{ inputs.job_id }}"
+          FORMAT="${{ inputs.format }}"
+          if [ "$FORMAT" = "long" ]; then
+            W=1920; H=1080; D=30
+          else
+            W=1080; H=1920; D=15
+          fi
+          ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=${D}:r=30 \
+            -vf "drawtext=text='Nybelic ${FORMAT}':fontsize=72:fontcolor=white:x=(w-text_w)/2:y=(h-text_h)/2" \
+            -c:v libx264 -pix_fmt yuv420p "output/${JOB_ID}.mp4"
+          ls -la output/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-${{ inputs.job_id }}
+          path: output/*.mp4
+          retention-days: 7
+
+      - name: Notify Hostinger
+        if: always()
+        run: |
+          if [ -n "${{ inputs.callback_url }}" ]; then
+            curl -sG "${{ inputs.callback_url }}" \
+              --data-urlencode "job_id=${{ inputs.job_id }}" \
+              --data-urlencode "status=${{ job.status }}" || true
+          fi
