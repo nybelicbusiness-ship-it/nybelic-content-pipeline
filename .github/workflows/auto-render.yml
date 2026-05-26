@@ -274,17 +274,20 @@ jobs:
               # ============================================================
               if [ "$SHOT_TYPE" = "explainer" ]; then
                 # Full-body Nybel KIRI 50% width, infografik bg KANAN tetap visible
-                # Bg di-shift ke kanan supaya gak ke-tutup karakter, atau pakai layout split
                 FB_W=$((W * 50 / 100))
-                FB_X=20  # margin kiri kecil
+                FB_X=20
                 FB_BOB="0+5*sin(2*PI*t/2)"
 
-                # Top label "Penjelasan" + caption box bawah
+                # Pre-calculate Y positions di shell (drawbox & drawtext gak pakai W/H literal)
+                BOX_Y=$((H - SUB_HEIGHT))
+                CAP_Y=$((H - SUB_HEIGHT + 80))
+                NAME_Y=$((H - SUB_HEIGHT + 20))
+
                 FILTER="[1:v]scale=${FB_W}:-1[fb_raw];[fb_raw]format=rgba,colorchannelmixer=aa=1.0[fb];"
                 FILTER="${FILTER}[0:v][fb]overlay=x=${FB_X}:y='H-h+${FB_BOB}'[bg2];"
-                FILTER="${FILTER}[bg2]drawbox=x=0:y=H-${SUB_HEIGHT}:w=W:h=${SUB_HEIGHT}:color=black\@0.72:t=fill[boxed];"
-                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=H-${SUB_HEIGHT}+20[named];"
-                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=H-${SUB_HEIGHT}+80:line_spacing=12[v]"
+                FILTER="${FILTER}[bg2]drawbox=x=0:y=${BOX_Y}:w=iw:h=${SUB_HEIGHT}:color=black@0.72:t=fill[boxed];"
+                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
+                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
 
                 ffmpeg -y \
                   -i shot_bg_${shotIdx}.mp4 \
@@ -310,13 +313,18 @@ jobs:
                 ACTIVE_BOB="0+8*sin(2*PI*t/0.5)"
                 LISTENER_BOB="0+3*sin(2*PI*t/2)"
 
+                # Pre-calculate Y positions di shell
+                BOX_Y=$((H - SUB_HEIGHT))
+                CAP_Y=$((H - SUB_HEIGHT + 80))
+                NAME_Y=$((H - SUB_HEIGHT + 20))
+
                 FILTER="[1:v]scale=${CHAR_W}:-1[active_raw];[active_raw]format=rgba,colorchannelmixer=aa=1.0[active];"
                 FILTER="${FILTER}[2:v]scale=${CHAR_W}:-1[lst_raw];[lst_raw]format=rgba,colorchannelmixer=aa=0.55[listener];"
                 FILTER="${FILTER}[0:v][listener]overlay=x=${LISTENER_X}:y='${LISTENER_Y_EXPR}+${LISTENER_BOB}'[bg1];"
                 FILTER="${FILTER}[bg1][active]overlay=x=${ACTIVE_X}:y='${ACTIVE_Y_EXPR}+${ACTIVE_BOB}'[bg2];"
-                FILTER="${FILTER}[bg2]drawbox=x=0:y=H-${SUB_HEIGHT}:w=W:h=${SUB_HEIGHT}:color=black\@0.72:t=fill[boxed];"
-                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=H-${SUB_HEIGHT}+20[named];"
-                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=H-${SUB_HEIGHT}+80:line_spacing=12[v]"
+                FILTER="${FILTER}[bg2]drawbox=x=0:y=${BOX_Y}:w=iw:h=${SUB_HEIGHT}:color=black@0.72:t=fill[boxed];"
+                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
+                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
 
                 ffmpeg -y \
                   -i shot_bg_${shotIdx}.mp4 \
