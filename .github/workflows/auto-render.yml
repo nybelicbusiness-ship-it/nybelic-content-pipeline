@@ -44,7 +44,7 @@ jobs:
 
           curl -sL "$ASSETS_URL" -o "assets/${JOB_ID}/manifest.json" || echo '{}' > "assets/${JOB_ID}/manifest.json"
 
-          # Voice: 8 scenes × 4 dialogs × 2 chars + cta
+          # Voice: 8 scenes × 4 dialogs × 2 chars + cta (zzz_cta_nybel.mp3 = play paling akhir)
           for sceneIdx in 0 1 2 3 4 5 6 7; do
             for dialogIdx in 0 1 2 3; do
               for char in nybel nybelic; do
@@ -55,7 +55,10 @@ jobs:
             fn=$(printf "scene%02d_bg.png" $sceneIdx)
             curl -sL -f -o "assets/${JOB_ID}/images/$fn" "$BASE_URL/images/$fn" 2>/dev/null || true
           done
-          curl -sL -f -o "assets/${JOB_ID}/voice/cta_nybel.mp3" "$BASE_URL/voice/cta_nybel.mp3" 2>/dev/null || true
+          # CTA (zzz prefix supaya alphabetical sort di paling akhir)
+          curl -sL -f -o "assets/${JOB_ID}/voice/zzz_cta_nybel.mp3" "$BASE_URL/voice/zzz_cta_nybel.mp3" 2>/dev/null || true
+          # Backward compat
+          curl -sL -f -o "assets/${JOB_ID}/voice/zzz_cta_nybel.mp3" "$BASE_URL/voice/cta_nybel.mp3" 2>/dev/null || true
 
           # Characters: 15 PNG dari Hostinger
           CHAR_BASE="${ORIGIN}/uploads/content-auto/characters"
@@ -72,9 +75,9 @@ jobs:
           echo "=== Characters ==="; ls -la "assets/${JOB_ID}/characters/" 2>/dev/null || echo "(empty)"
 
       # ---------------------------------------------------------------
-      # 3. RENDER
+      # 3. RENDER PER-SCENE — biar background sync sama voice scene
       # ---------------------------------------------------------------
-      - name: Render video with FFmpeg + character overlay
+      - name: Render video with per-scene background sync + Ken Burns
         env:
           JOB_ID: ${{ inputs.job_id }}
           FORMAT: ${{ inputs.format }}
@@ -91,45 +94,75 @@ jobs:
           fi
           echo "Format=$FORMAT W=$W H=$H"
 
-          # ----- Concat audio -----
-          VOICE_COUNT=$(ls voice/*.mp3 2>/dev/null | wc -l)
-          if [ "$VOICE_COUNT" -gt 0 ]; then
-            ls voice/*.mp3 | sort > voice-list-raw.txt
-            sed "s|^|file '|;s|$|'|" voice-list-raw.txt > voice-list.txt
-            ffmpeg -y -f concat -safe 0 -i voice-list.txt -c copy full_audio.mp3 || \
-              ffmpeg -y -f concat -safe 0 -i voice-list.txt -c:a libmp3lame -q:a 4 full_audio.mp3
+          # ----- Per-scene render: setiap scene buat slideshow.mp4 sendiri -----
+          # Kumpulkan semua scene index yang punya voice
+          SCENE_INDICES=$(ls voice/scene*.mp3 2>/dev/null | sed -E 's|.*scene([0-9]+)_.*|\1|' | sort -u)
+          echo "Scenes detected: $SCENE_INDICES"
+
+          if [ -z "$SCENE_INDICES" ]; then
+            echo "⚠️  No scene voice files. Falling back to flat concat."
+            SCENE_INDICES="00"
+          fi
+
+          rm -f scene-list.txt
+          for sceneIdx in $SCENE_INDICES; do
+            # Concat audio dari satu scene (semua dialog + char)
+            ls voice/scene${sceneIdx}_*.mp3 2>/dev/null | sort > scene${sceneIdx}-voice-raw.txt
+            if [ ! -s scene${sceneIdx}-voice-raw.txt ]; then continue; fi
+            sed "s|^|file '|;s|$|'|" scene${sceneIdx}-voice-raw.txt > scene${sceneIdx}-voice.txt
+            ffmpeg -y -f concat -safe 0 -i scene${sceneIdx}-voice.txt -c:a libmp3lame -q:a 4 scene${sceneIdx}_audio.mp3 2>/dev/null || \
+              ffmpeg -y -f concat -safe 0 -i scene${sceneIdx}-voice.txt -c copy scene${sceneIdx}_audio.mp3
+            SCENE_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 scene${sceneIdx}_audio.mp3 || echo "3")
+            SCENE_DUR_INT=$(printf "%.0f" "$SCENE_DUR")
+            [ -z "$SCENE_DUR_INT" ] || [ "$SCENE_DUR_INT" -lt 2 ] && SCENE_DUR_INT=3
+
+            # Background image untuk scene ini
+            BG="images/scene${sceneIdx}_bg.png"
+            if [ ! -f "$BG" ]; then
+              # Fallback: pakai bg scene pertama yang ada
+              BG=$(ls images/scene*_bg.png 2>/dev/null | head -1)
+            fi
+
+            # Render slideshow per scene dengan Ken Burns zoompan
+            # Ken Burns: zoom dari 1.0 → 1.1 selama scene
+            FPS=30
+            TOTAL_FRAMES=$((SCENE_DUR_INT * FPS))
+            if [ -f "$BG" ]; then
+              ffmpeg -y -loop 1 -t $SCENE_DUR_INT -i "$BG" \
+                -vf "scale=8000:-1,zoompan=z='min(zoom+0.0015,1.15)':d=${TOTAL_FRAMES}:s=${W}x${H}:fps=${FPS},setsar=1" \
+                -c:v libx264 -pix_fmt yuv420p -preset fast -t $SCENE_DUR_INT scene${sceneIdx}_video.mp4
+            else
+              # Fallback solid color
+              ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=${SCENE_DUR_INT}:r=${FPS} \
+                -c:v libx264 -pix_fmt yuv420p scene${sceneIdx}_video.mp4
+            fi
+
+            echo "file 'scene${sceneIdx}_video.mp4'" >> scene-list.txt
+            echo "Scene ${sceneIdx}: ${SCENE_DUR_INT}s, BG=$BG"
+          done
+
+          # ----- Concat all scene videos -----
+          if [ -s scene-list.txt ]; then
+            ffmpeg -y -f concat -safe 0 -i scene-list.txt -c copy slideshow.mp4
           else
-            ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 30 -q:a 9 -acodec libmp3lame full_audio.mp3
+            echo "❌ No scenes generated"
+            ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=15:r=30 -c:v libx264 -pix_fmt yuv420p slideshow.mp4
+          fi
+
+          # ----- Concat all audio (scene order + cta paling akhir karena prefix zzz) -----
+          ls voice/*.mp3 2>/dev/null | sort > voice-list-raw.txt
+          if [ -s voice-list-raw.txt ]; then
+            sed "s|^|file '|;s|$|'|" voice-list-raw.txt > voice-list.txt
+            ffmpeg -y -f concat -safe 0 -i voice-list.txt -c:a libmp3lame -q:a 4 full_audio.mp3 || \
+              ffmpeg -y -f concat -safe 0 -i voice-list.txt -c copy full_audio.mp3
+          else
+            ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 15 -q:a 9 -acodec libmp3lame full_audio.mp3
           fi
 
           DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 full_audio.mp3 || echo "0")
-          # Floor → integer detik (FFmpeg -t butuh detik bulat untuk paksa durasi)
           DURATION_INT=$(printf "%.0f" "$DURATION")
-          # Safety: minimum 15 detik supaya gak ada hasil 1-detik lagi
-          if [ -z "$DURATION_INT" ] || [ "$DURATION_INT" -lt 15 ]; then
-            DURATION_INT=15
-          fi
-          echo "AudioDuration=${DURATION}s → render=${DURATION_INT}s"
-
-          # ----- Slideshow -----
-          IMG_COUNT=$(ls images/*.png 2>/dev/null | wc -l)
-          if [ "$IMG_COUNT" -gt 0 ]; then
-            SCENE_DUR=$(echo "scale=3; $DURATION_INT / $IMG_COUNT" | bc)
-            > img-list.txt
-            for img in $(ls images/*.png | sort); do
-              echo "file '$img'" >> img-list.txt
-              echo "duration $SCENE_DUR" >> img-list.txt
-            done
-            LAST_IMG=$(ls images/*.png | sort | tail -1)
-            echo "file '$LAST_IMG'" >> img-list.txt
-            ffmpeg -y -f concat -safe 0 -i img-list.txt \
-              -vf "scale=$W:$H:force_original_aspect_ratio=increase,crop=$W:$H,setsar=1,fps=30" \
-              -t $DURATION_INT \
-              -c:v libx264 -pix_fmt yuv420p -preset fast slideshow.mp4
-          else
-            ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=${DURATION_INT}:r=30 \
-              -c:v libx264 -pix_fmt yuv420p slideshow.mp4
-          fi
+          [ -z "$DURATION_INT" ] || [ "$DURATION_INT" -lt 15 ] && DURATION_INT=15
+          echo "Total audio duration: ${DURATION_INT}s"
 
           # ----- Pick character files -----
           NYBEL_FILE="characters/nybel-talking.png"
@@ -143,20 +176,18 @@ jobs:
           echo "Nybel = $NYBEL_FILE"
           echo "Nybelic = $NYBELIC_FILE"
 
-          # ----- Layout integer math (FFmpeg gak parse $H*0.45 di scale filter) -----
+          # ----- Layout integer math -----
           if [ "$FORMAT" = "long" ]; then
-            # 16:9 — karakter lebih kecil, dua-duanya kiri & kanan bawah
-            H_NYBEL=$((H * 35 / 100))      # ~378px
-            H_NYBELIC=$((H * 30 / 100))    # ~324px
+            H_NYBEL=$((H * 35 / 100))
+            H_NYBELIC=$((H * 30 / 100))
             NYBEL_X=60
-            NYBEL_Y_OFFSET=40              # px dari bottom
-            NYBELIC_X_OFFSET=60            # px dari right
+            NYBEL_Y_OFFSET=40
+            NYBELIC_X_OFFSET=60
             NYBELIC_Y_OFFSET=40
             FONT_SIZE=56
           else
-            # 9:16 — karakter besar dua-duanya bawah, gak overlap
-            H_NYBEL=$((H * 45 / 100))      # ~864px
-            H_NYBELIC=$((H * 38 / 100))    # ~730px
+            H_NYBEL=$((H * 45 / 100))
+            H_NYBELIC=$((H * 38 / 100))
             NYBEL_X=40
             NYBEL_Y_OFFSET=60
             NYBELIC_X_OFFSET=40
@@ -165,18 +196,23 @@ jobs:
           fi
           echo "Layout: H_NYBEL=$H_NYBEL H_NYBELIC=$H_NYBELIC"
 
-          # ----- Title (sanitize: hapus quote & backslash supaya FFmpeg drawtext aman) -----
+          # ----- Title sanitize -----
           TITLE=$(jq -r '.title // "Nybelic"' manifest.json 2>/dev/null | head -c 60 | sed "s/['\"\\\\:]//g")
           [ -z "$TITLE" ] && TITLE="Nybelic"
           echo "Title: $TITLE"
 
-          # ----- Final render -----
+          # ----- Add subtle bobbing animation pada karakter (sin wave 0-2px tiap detik) -----
+          # Karakter "ngangguk" pelan supaya gak terlihat static
+          NYBEL_BOB="0+5*sin(2*PI*t/2)"
+          NYBELIC_BOB="0+5*sin(2*PI*t/1.5+1)"
+
+          # ----- Final render with character overlay + bobbing animation -----
           if [ -f "$NYBEL_FILE" ] && [ -f "$NYBELIC_FILE" ]; then
-            echo "Rendering with both characters"
+            echo "Rendering with both characters + Ken Burns + bobbing"
             FILTER="[1:v]scale=-1:${H_NYBEL}[nybel];"
             FILTER="${FILTER}[2:v]scale=-1:${H_NYBELIC}[nybelic];"
-            FILTER="${FILTER}[0:v][nybel]overlay=${NYBEL_X}:H-h-${NYBEL_Y_OFFSET}:shortest=0[bg1];"
-            FILTER="${FILTER}[bg1][nybelic]overlay=W-w-${NYBELIC_X_OFFSET}:H-h-${NYBELIC_Y_OFFSET}:shortest=0,"
+            FILTER="${FILTER}[0:v][nybel]overlay=x=${NYBEL_X}:y='H-h-${NYBEL_Y_OFFSET}+${NYBEL_BOB}':shortest=0[bg1];"
+            FILTER="${FILTER}[bg1][nybelic]overlay=x='W-w-${NYBELIC_X_OFFSET}':y='H-h-${NYBELIC_Y_OFFSET}+${NYBELIC_BOB}':shortest=0,"
             FILTER="${FILTER}drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]"
 
             ffmpeg -y \
@@ -194,7 +230,7 @@ jobs:
           elif [ -f "$NYBEL_FILE" ]; then
             echo "Rendering with NYBEL only"
             FILTER="[1:v]scale=-1:${H_NYBEL}[nybel];"
-            FILTER="${FILTER}[0:v][nybel]overlay=${NYBEL_X}:H-h-${NYBEL_Y_OFFSET}:shortest=0,"
+            FILTER="${FILTER}[0:v][nybel]overlay=x=${NYBEL_X}:y='H-h-${NYBEL_Y_OFFSET}+${NYBEL_BOB}':shortest=0,"
             FILTER="${FILTER}drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]"
 
             ffmpeg -y \
@@ -209,7 +245,7 @@ jobs:
               "../../output/${JOB_ID}.mp4"
 
           else
-            echo "Rendering slideshow only (no characters)"
+            echo "Rendering slideshow only"
             ffmpeg -y \
               -i slideshow.mp4 \
               -i full_audio.mp3 \
@@ -226,7 +262,7 @@ jobs:
           echo "✅ Render complete"
 
       # ---------------------------------------------------------------
-      # 4. UPLOAD TO HOSTINGER (optional, jika FTP secret diset)
+      # 4. UPLOAD TO HOSTINGER (optional)
       # ---------------------------------------------------------------
       - name: Upload to Hostinger via FTP
         env:
@@ -249,7 +285,7 @@ jobs:
           fi
 
       # ---------------------------------------------------------------
-      # 5. ARTIFACT (selalu)
+      # 5. ARTIFACT
       # ---------------------------------------------------------------
       - name: Upload as GitHub artifact
         uses: actions/upload-artifact@v4
