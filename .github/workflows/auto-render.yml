@@ -7,11 +7,11 @@ on:
         description: 'Job ID'
         required: true
       format:
-        description: 'Format'
+        description: 'Format (long | short | tiktok)'
         required: true
         default: 'long'
       assets_url:
-        description: 'Manifest URL'
+        description: 'Manifest URL (https://nybelic.com/uploads/.../manifest.json)'
         required: true
       callback_url:
         description: 'Callback URL'
@@ -20,12 +20,18 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     steps:
+      # ---------------------------------------------------------------
+      # 1. SETUP
+      # ---------------------------------------------------------------
       - name: Setup FFmpeg + jq + bc
         run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq bc
 
-      - name: Fetch assets from Hostinger
+      # ---------------------------------------------------------------
+      # 2. FETCH ASSETS
+      # ---------------------------------------------------------------
+      - name: Fetch manifest + assets from Hostinger
         env:
           ASSETS_URL: ${{ inputs.assets_url }}
           JOB_ID: ${{ inputs.job_id }}
@@ -38,6 +44,7 @@ jobs:
 
           curl -sL "$ASSETS_URL" -o "assets/${JOB_ID}/manifest.json" || echo '{}' > "assets/${JOB_ID}/manifest.json"
 
+          # Voice: 8 scenes × 4 dialogs × 2 chars + cta
           for sceneIdx in 0 1 2 3 4 5 6 7; do
             for dialogIdx in 0 1 2 3; do
               for char in nybel nybelic; do
@@ -50,51 +57,61 @@ jobs:
           done
           curl -sL -f -o "assets/${JOB_ID}/voice/cta_nybel.mp3" "$BASE_URL/voice/cta_nybel.mp3" 2>/dev/null || true
 
+          # Characters: 15 PNG dari Hostinger
           CHAR_BASE="${ORIGIN}/uploads/content-auto/characters"
           for f in nybel-idle nybel-talking nybel-thinking nybel-idea nybel-sad nybel-excited nybel-laughing nybel-pointing \
                    nybelic-idle nybelic-talking nybelic-thinking nybelic-excited nybelic-chill nybelic-laughing nybelic-sad; do
             curl -sL -f -o "assets/${JOB_ID}/characters/${f}.png" "${CHAR_BASE}/${f}.png" 2>/dev/null || true
           done
 
-          find "assets/${JOB_ID}" -size -1k -delete
+          # Cleanup file kosong / 404 HTML
+          find "assets/${JOB_ID}" -size -1k -delete 2>/dev/null || true
 
-          echo "=== Voice files ==="
-          ls -la "assets/${JOB_ID}/voice/" 2>/dev/null || echo "(empty)"
-          echo "=== Image files ==="
-          ls -la "assets/${JOB_ID}/images/" 2>/dev/null || echo "(empty)"
-          echo "=== Character files ==="
-          ls -la "assets/${JOB_ID}/characters/" 2>/dev/null || echo "(empty)"
+          echo "=== Voice ==="; ls -la "assets/${JOB_ID}/voice/" 2>/dev/null || echo "(empty)"
+          echo "=== Images ==="; ls -la "assets/${JOB_ID}/images/" 2>/dev/null || echo "(empty)"
+          echo "=== Characters ==="; ls -la "assets/${JOB_ID}/characters/" 2>/dev/null || echo "(empty)"
 
-      - name: Render video with character overlay
+      # ---------------------------------------------------------------
+      # 3. RENDER
+      # ---------------------------------------------------------------
+      - name: Render video with FFmpeg + character overlay
         env:
           JOB_ID: ${{ inputs.job_id }}
           FORMAT: ${{ inputs.format }}
         run: |
+          set -e
           mkdir -p output
           cd "assets/${JOB_ID}"
 
+          # ----- Aspect ratio -----
           if [ "$FORMAT" = "long" ]; then
             W=1920; H=1080
           else
             W=1080; H=1920
           fi
+          echo "Format=$FORMAT W=$W H=$H"
 
-          # ===== Step 1: Concat audio =====
+          # ----- Concat audio -----
           VOICE_COUNT=$(ls voice/*.mp3 2>/dev/null | wc -l)
           if [ "$VOICE_COUNT" -gt 0 ]; then
             ls voice/*.mp3 | sort > voice-list-raw.txt
             sed "s|^|file '|;s|$|'|" voice-list-raw.txt > voice-list.txt
-            ffmpeg -y -f concat -safe 0 -i voice-list.txt -c copy full_audio.mp3
+            ffmpeg -y -f concat -safe 0 -i voice-list.txt -c copy full_audio.mp3 || \
+              ffmpeg -y -f concat -safe 0 -i voice-list.txt -c:a libmp3lame -q:a 4 full_audio.mp3
           else
             ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 30 -q:a 9 -acodec libmp3lame full_audio.mp3
           fi
-          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 full_audio.mp3)
-          # Round up to integer for safety
-          DURATION_INT=$(echo "$DURATION" | awk '{print int($1+0.999)}')
-          [ -z "$DURATION_INT" ] || [ "$DURATION_INT" -lt 5 ] && DURATION_INT=15
-          echo "Audio duration: ${DURATION}s (using ${DURATION_INT}s for video)"
 
-          # ===== Step 2: Build slideshow background =====
+          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 full_audio.mp3 || echo "0")
+          # Floor → integer detik (FFmpeg -t butuh detik bulat untuk paksa durasi)
+          DURATION_INT=$(printf "%.0f" "$DURATION")
+          # Safety: minimum 15 detik supaya gak ada hasil 1-detik lagi
+          if [ -z "$DURATION_INT" ] || [ "$DURATION_INT" -lt 15 ]; then
+            DURATION_INT=15
+          fi
+          echo "AudioDuration=${DURATION}s → render=${DURATION_INT}s"
+
+          # ----- Slideshow -----
           IMG_COUNT=$(ls images/*.png 2>/dev/null | wc -l)
           if [ "$IMG_COUNT" -gt 0 ]; then
             SCENE_DUR=$(echo "scale=3; $DURATION_INT / $IMG_COUNT" | bc)
@@ -107,73 +124,144 @@ jobs:
             echo "file '$LAST_IMG'" >> img-list.txt
             ffmpeg -y -f concat -safe 0 -i img-list.txt \
               -vf "scale=$W:$H:force_original_aspect_ratio=increase,crop=$W:$H,setsar=1,fps=30" \
-              -c:v libx264 -pix_fmt yuv420p -preset fast -t $DURATION_INT slideshow.mp4
+              -t $DURATION_INT \
+              -c:v libx264 -pix_fmt yuv420p -preset fast slideshow.mp4
           else
             ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=${DURATION_INT}:r=30 \
               -c:v libx264 -pix_fmt yuv420p slideshow.mp4
           fi
 
-          # ===== Step 3: Pick character files =====
+          # ----- Pick character files -----
           NYBEL_FILE="characters/nybel-talking.png"
-          NYBELIC_FILE="characters/nybelic-idle.png"
           [ ! -f "$NYBEL_FILE" ] && NYBEL_FILE="characters/nybel-idle.png"
-          [ ! -f "$NYBELIC_FILE" ] && NYBELIC_FILE="characters/nybelic-talking.png"
+          [ ! -f "$NYBEL_FILE" ] && NYBEL_FILE=$(ls characters/nybel-*.png 2>/dev/null | head -1)
 
-          # ===== Step 4: Title text =====
-          TITLE=$(jq -r '.title // "Nybelic"' manifest.json | head -c 60 | tr -d "'\"" )
+          NYBELIC_FILE="characters/nybelic-talking.png"
+          [ ! -f "$NYBELIC_FILE" ] && NYBELIC_FILE="characters/nybelic-idle.png"
+          [ ! -f "$NYBELIC_FILE" ] && NYBELIC_FILE=$(ls characters/nybelic-*.png 2>/dev/null | head -1)
 
-          # ===== Step 5: Render with character overlay =====
-          # IMPORTANT: PNG character pakai -loop 1 supaya dibaca sebagai infinite stream
-          # dan -t pada output supaya durasi mengikuti audio
+          echo "Nybel = $NYBEL_FILE"
+          echo "Nybelic = $NYBELIC_FILE"
+
+          # ----- Layout integer math (FFmpeg gak parse $H*0.45 di scale filter) -----
+          if [ "$FORMAT" = "long" ]; then
+            # 16:9 — karakter lebih kecil, dua-duanya kiri & kanan bawah
+            H_NYBEL=$((H * 35 / 100))      # ~378px
+            H_NYBELIC=$((H * 30 / 100))    # ~324px
+            NYBEL_X=60
+            NYBEL_Y_OFFSET=40              # px dari bottom
+            NYBELIC_X_OFFSET=60            # px dari right
+            NYBELIC_Y_OFFSET=40
+            FONT_SIZE=56
+          else
+            # 9:16 — karakter besar dua-duanya bawah, gak overlap
+            H_NYBEL=$((H * 45 / 100))      # ~864px
+            H_NYBELIC=$((H * 38 / 100))    # ~730px
+            NYBEL_X=40
+            NYBEL_Y_OFFSET=60
+            NYBELIC_X_OFFSET=40
+            NYBELIC_Y_OFFSET=60
+            FONT_SIZE=72
+          fi
+          echo "Layout: H_NYBEL=$H_NYBEL H_NYBELIC=$H_NYBELIC"
+
+          # ----- Title (sanitize: hapus quote & backslash supaya FFmpeg drawtext aman) -----
+          TITLE=$(jq -r '.title // "Nybelic"' manifest.json 2>/dev/null | head -c 60 | sed "s/['\"\\\\:]//g")
+          [ -z "$TITLE" ] && TITLE="Nybelic"
+          echo "Title: $TITLE"
+
+          # ----- Final render -----
           if [ -f "$NYBEL_FILE" ] && [ -f "$NYBELIC_FILE" ]; then
-            echo "Rendering with characters..."
-            if [ "$FORMAT" = "long" ]; then
-              # 16:9: NYBEL kiri-bawah (35% height), NYBELIC kanan-bawah (30% height)
-              FILTER="[1:v]scale=-1:$((H*35/100))[nybel];[2:v]scale=-1:$((H*30/100))[nybelic];[0:v][nybel]overlay=W*0.05:H-h-30:shortest=0[bg1];[bg1][nybelic]overlay=W-w-W*0.05:H-h-50:shortest=0,drawtext=text='${TITLE}':fontsize=56:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=60:enable='between(t,0,3)'[v]"
-            else
-              # 9:16: NYBEL kiri-bawah (45% height), NYBELIC kanan-bawah (38% height)
-              FILTER="[1:v]scale=-1:$((H*45/100))[nybel];[2:v]scale=-1:$((H*38/100))[nybelic];[0:v][nybel]overlay=20:H-h-30:shortest=0[bg1];[bg1][nybelic]overlay=W-w-20:H-h-50:shortest=0,drawtext=text='${TITLE}':fontsize=72:fontcolor=white:borderw=5:bordercolor=black:x=(w-text_w)/2:y=H*0.05:enable='between(t,0,3)'[v]"
-            fi
-            ffmpeg -y -i slideshow.mp4 \
+            echo "Rendering with both characters"
+            FILTER="[1:v]scale=-1:${H_NYBEL}[nybel];"
+            FILTER="${FILTER}[2:v]scale=-1:${H_NYBELIC}[nybelic];"
+            FILTER="${FILTER}[0:v][nybel]overlay=${NYBEL_X}:H-h-${NYBEL_Y_OFFSET}:shortest=0[bg1];"
+            FILTER="${FILTER}[bg1][nybelic]overlay=W-w-${NYBELIC_X_OFFSET}:H-h-${NYBELIC_Y_OFFSET}:shortest=0,"
+            FILTER="${FILTER}drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]"
+
+            ffmpeg -y \
+              -i slideshow.mp4 \
               -loop 1 -t $DURATION_INT -i "$NYBEL_FILE" \
               -loop 1 -t $DURATION_INT -i "$NYBELIC_FILE" \
               -i full_audio.mp3 \
               -filter_complex "$FILTER" \
               -map "[v]" -map 3:a \
-              -c:v libx264 -c:a aac -preset fast -t $DURATION_INT \
+              -c:v libx264 -pix_fmt yuv420p -preset fast \
+              -c:a aac -b:a 192k \
+              -t $DURATION_INT \
               "../../output/${JOB_ID}.mp4"
+
+          elif [ -f "$NYBEL_FILE" ]; then
+            echo "Rendering with NYBEL only"
+            FILTER="[1:v]scale=-1:${H_NYBEL}[nybel];"
+            FILTER="${FILTER}[0:v][nybel]overlay=${NYBEL_X}:H-h-${NYBEL_Y_OFFSET}:shortest=0,"
+            FILTER="${FILTER}drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]"
+
+            ffmpeg -y \
+              -i slideshow.mp4 \
+              -loop 1 -t $DURATION_INT -i "$NYBEL_FILE" \
+              -i full_audio.mp3 \
+              -filter_complex "$FILTER" \
+              -map "[v]" -map 2:a \
+              -c:v libx264 -pix_fmt yuv420p -preset fast \
+              -c:a aac -b:a 192k \
+              -t $DURATION_INT \
+              "../../output/${JOB_ID}.mp4"
+
           else
-            echo "No characters, fallback to slideshow + title only"
-            ffmpeg -y -i slideshow.mp4 -i full_audio.mp3 \
-              -filter_complex "[0:v]drawtext=text='${TITLE}':fontsize=56:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=h-150:enable='between(t,0,3)'[v]" \
-              -map "[v]" -map 1:a -c:v libx264 -c:a aac -preset fast -t $DURATION_INT \
+            echo "Rendering slideshow only (no characters)"
+            ffmpeg -y \
+              -i slideshow.mp4 \
+              -i full_audio.mp3 \
+              -filter_complex "[0:v]drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]" \
+              -map "[v]" -map 1:a \
+              -c:v libx264 -pix_fmt yuv420p -preset fast \
+              -c:a aac -b:a 192k \
+              -t $DURATION_INT \
               "../../output/${JOB_ID}.mp4"
           fi
 
           ls -la "../../output/"
-          OUT_DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "../../output/${JOB_ID}.mp4")
-          echo "✅ Output video duration: ${OUT_DURATION}s"
+          ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "../../output/${JOB_ID}.mp4" || true
+          echo "✅ Render complete"
 
+      # ---------------------------------------------------------------
+      # 4. UPLOAD TO HOSTINGER (optional, jika FTP secret diset)
+      # ---------------------------------------------------------------
       - name: Upload to Hostinger via FTP
-        if: ${{ env.HAS_FTP == 'true' }}
         env:
-          HAS_FTP: ${{ secrets.HOSTINGER_FTP_HOST != '' }}
-          JOB_ID: ${{ inputs.job_id }}
           FTP_HOST: ${{ secrets.HOSTINGER_FTP_HOST }}
           FTP_USER: ${{ secrets.HOSTINGER_FTP_USER }}
           FTP_PASS: ${{ secrets.HOSTINGER_FTP_PASS }}
           FTP_PATH: ${{ secrets.HOSTINGER_FTP_PATH }}
+          JOB_ID: ${{ inputs.job_id }}
         run: |
-          curl -T "output/${JOB_ID}.mp4" --user "${FTP_USER}:${FTP_PASS}" --ftp-create-dirs "ftp://${FTP_HOST}/${FTP_PATH}/${JOB_ID}.mp4" || echo "FTP upload failed"
+          if [ -n "$FTP_HOST" ] && [ -n "$FTP_USER" ] && [ -n "$FTP_PASS" ]; then
+            REMOTE_DIR="${FTP_PATH:-public_html/uploads/content-auto/output}"
+            curl -T "output/${JOB_ID}.mp4" \
+              --user "${FTP_USER}:${FTP_PASS}" \
+              --ftp-create-dirs \
+              "ftp://${FTP_HOST}/${REMOTE_DIR}/${JOB_ID}.mp4" \
+              && echo "✅ FTP upload OK" \
+              || echo "⚠️  FTP upload failed (non-fatal)"
+          else
+            echo "⏭️  FTP secrets not configured, skip upload"
+          fi
 
-      - name: Upload as artifact
+      # ---------------------------------------------------------------
+      # 5. ARTIFACT (selalu)
+      # ---------------------------------------------------------------
+      - name: Upload as GitHub artifact
         uses: actions/upload-artifact@v4
         with:
           name: video-${{ inputs.job_id }}
           path: output/*.mp4
           retention-days: 7
 
-      - name: Notify Hostinger
+      # ---------------------------------------------------------------
+      # 6. CALLBACK
+      # ---------------------------------------------------------------
+      - name: Notify Hostinger callback
         if: always()
         env:
           CALLBACK_URL: ${{ inputs.callback_url }}
@@ -182,5 +270,7 @@ jobs:
           if [ -n "$CALLBACK_URL" ]; then
             curl -sG "$CALLBACK_URL" \
               --data-urlencode "job_id=$JOB_ID" \
-              --data-urlencode "status=${{ job.status }}" || true
+              --data-urlencode "status=${{ job.status }}" \
+              --data-urlencode "run_id=${{ github.run_id }}" \
+              || true
           fi
