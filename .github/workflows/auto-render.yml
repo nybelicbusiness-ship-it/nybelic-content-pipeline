@@ -20,17 +20,19 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
-      # ---------------------------------------------------------------
+      # ===========================================================
       # 1. SETUP
-      # ---------------------------------------------------------------
-      - name: Setup FFmpeg + jq + bc
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg jq bc
+      # ===========================================================
+      - name: Setup FFmpeg + jq + bc + fonts
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq bc fonts-noto-color-emoji fonts-dejavu fonts-noto-cjk
 
-      # ---------------------------------------------------------------
+      # ===========================================================
       # 2. FETCH ASSETS
-      # ---------------------------------------------------------------
+      # ===========================================================
       - name: Fetch manifest + assets from Hostinger
         env:
           ASSETS_URL: ${{ inputs.assets_url }}
@@ -39,14 +41,15 @@ jobs:
           mkdir -p assets/${JOB_ID}/voice
           mkdir -p assets/${JOB_ID}/images
           mkdir -p assets/${JOB_ID}/characters
+          mkdir -p assets/${JOB_ID}/music
           BASE_URL=$(dirname "$ASSETS_URL")
           ORIGIN=$(echo "$ASSETS_URL" | sed -E 's|^(https?://[^/]+).*|\1|')
 
           curl -sL "$ASSETS_URL" -o "assets/${JOB_ID}/manifest.json" || echo '{}' > "assets/${JOB_ID}/manifest.json"
 
-          # Voice: 8 scenes × 4 dialogs × 2 chars + cta (zzz_cta_nybel.mp3 = play paling akhir)
+          # Voice files (per-dialog + cta)
           for sceneIdx in 0 1 2 3 4 5 6 7; do
-            for dialogIdx in 0 1 2 3; do
+            for dialogIdx in 0 1 2 3 4; do
               for char in nybel nybelic; do
                 fn=$(printf "scene%02d_dialog%02d_%s.mp3" $sceneIdx $dialogIdx $char)
                 curl -sL -f -o "assets/${JOB_ID}/voice/$fn" "$BASE_URL/voice/$fn" 2>/dev/null || true
@@ -55,29 +58,33 @@ jobs:
             fn=$(printf "scene%02d_bg.png" $sceneIdx)
             curl -sL -f -o "assets/${JOB_ID}/images/$fn" "$BASE_URL/images/$fn" 2>/dev/null || true
           done
-          # CTA (zzz prefix supaya alphabetical sort di paling akhir)
           curl -sL -f -o "assets/${JOB_ID}/voice/zzz_cta_nybel.mp3" "$BASE_URL/voice/zzz_cta_nybel.mp3" 2>/dev/null || true
-          # Backward compat
-          curl -sL -f -o "assets/${JOB_ID}/voice/zzz_cta_nybel.mp3" "$BASE_URL/voice/cta_nybel.mp3" 2>/dev/null || true
 
-          # Characters: 15 PNG dari Hostinger
+          # Characters (15 PNG)
           CHAR_BASE="${ORIGIN}/uploads/content-auto/characters"
           for f in nybel-idle nybel-talking nybel-thinking nybel-idea nybel-sad nybel-excited nybel-laughing nybel-pointing \
                    nybelic-idle nybelic-talking nybelic-thinking nybelic-excited nybelic-chill nybelic-laughing nybelic-sad; do
             curl -sL -f -o "assets/${JOB_ID}/characters/${f}.png" "${CHAR_BASE}/${f}.png" 2>/dev/null || true
           done
 
-          # Cleanup file kosong / 404 HTML
+          # Background music (lo-fi instrumental dari free CDN — kosong kalau gak ada)
+          curl -sL -f -o "assets/${JOB_ID}/music/bgm.mp3" \
+            "${ORIGIN}/uploads/content-auto/music/bgm.mp3" 2>/dev/null || true
+
+          # Cleanup file kecil/404
           find "assets/${JOB_ID}" -size -1k -delete 2>/dev/null || true
 
-          echo "=== Voice ==="; ls -la "assets/${JOB_ID}/voice/" 2>/dev/null || echo "(empty)"
-          echo "=== Images ==="; ls -la "assets/${JOB_ID}/images/" 2>/dev/null || echo "(empty)"
-          echo "=== Characters ==="; ls -la "assets/${JOB_ID}/characters/" 2>/dev/null || echo "(empty)"
+          echo "=== Voice ==="; ls -la "assets/${JOB_ID}/voice/" 2>/dev/null
+          echo "=== Images ==="; ls -la "assets/${JOB_ID}/images/" 2>/dev/null
+          IMG_CNT=$(ls assets/${JOB_ID}/images/*.png 2>/dev/null | wc -l)
+          echo "Image count: $IMG_CNT"
+          echo "=== Characters ==="; ls -la "assets/${JOB_ID}/characters/" 2>/dev/null
+          echo "=== Music ==="; ls -la "assets/${JOB_ID}/music/" 2>/dev/null
 
-      # ---------------------------------------------------------------
-      # 3. RENDER PER-SCENE — biar background sync sama voice scene
-      # ---------------------------------------------------------------
-      - name: Render video with per-scene background sync + Ken Burns
+      # ===========================================================
+      # 3. RENDER PER-DIALOG (Kok-Bisa style)
+      # ===========================================================
+      - name: Render Kok-Bisa style video
         env:
           JOB_ID: ${{ inputs.job_id }}
           FORMAT: ${{ inputs.format }}
@@ -88,229 +95,320 @@ jobs:
 
           # ----- Aspect ratio -----
           if [ "$FORMAT" = "long" ]; then
-            W=1920; H=1080
+            W=1920; H=1080; FONT_BIG=72; FONT_CAP=42; FONT_NAME=32
+            CHAR_W_PCT=22; SUB_HEIGHT=180
           else
-            W=1080; H=1920
+            W=1080; H=1920; FONT_BIG=82; FONT_CAP=48; FONT_NAME=36
+            CHAR_W_PCT=42; SUB_HEIGHT=240
           fi
-          echo "Format=$FORMAT W=$W H=$H"
+          FPS=30
+          FONT_PATH="/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+          [ ! -f "$FONT_PATH" ] && FONT_PATH=$(fc-match -f '%{file}' DejaVuSans:Bold 2>/dev/null || echo "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 
-          # ----- Per-scene render: setiap scene buat slideshow.mp4 sendiri -----
-          # Kumpulkan semua scene index yang punya voice
-          SCENE_INDICES=$(ls voice/scene*.mp3 2>/dev/null | sed -E 's|.*scene([0-9]+)_.*|\1|' | sort -u)
-          echo "Scenes detected: $SCENE_INDICES"
+          BRAND_PRIMARY=$(jq -r '.brand_color_primary // "#7c3aed"' manifest.json | sed 's/#//')
+          BRAND_SECONDARY=$(jq -r '.brand_color_secondary // "#ec4899"' manifest.json | sed 's/#//')
+          BRAND_ACCENT=$(jq -r '.brand_color_accent // "#f59e0b"' manifest.json | sed 's/#//')
+          TITLE=$(jq -r '.title // "Nybelic"' manifest.json | head -c 80 | sed "s/['\"\\\\:]//g")
+          [ -z "$TITLE" ] && TITLE="Nybelic"
+          CHANNEL=$(jq -r '.channel_name // "NYBELIC"' manifest.json)
+          WEBSITE=$(jq -r '.website // "nybelic.com"' manifest.json)
+          echo "Format=$FORMAT W=$W H=$H Title=$TITLE"
 
-          if [ -z "$SCENE_INDICES" ]; then
-            echo "⚠️  No scene voice files. Falling back to flat concat."
-            SCENE_INDICES="00"
-          fi
-
-          rm -f scene-list.txt
-          for sceneIdx in $SCENE_INDICES; do
-            # Validate setiap MP3 dulu — skip yang corrupt
-            VALID_MP3=()
-            for mp3 in $(ls voice/scene${sceneIdx}_*.mp3 2>/dev/null | sort); do
-              # Cek apakah MP3 valid: ffprobe harus return durasi > 0
-              DUR=$(ffprobe -v error -analyzeduration 5000000 -probesize 5000000 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp3" 2>/dev/null || echo "0")
-              if [ -n "$DUR" ] && [ "$(echo "$DUR > 0.1" | bc 2>/dev/null || echo 0)" = "1" ]; then
-                VALID_MP3+=("$mp3")
-              else
-                echo "⚠️  Skipping corrupt MP3: $mp3 (duration=$DUR)"
-              fi
-            done
-
-            if [ ${#VALID_MP3[@]} -eq 0 ]; then
-              echo "⚠️  Scene $sceneIdx: no valid MP3, skip"
-              continue
-            fi
-
-            # Re-encode setiap MP3 ke format yang konsisten (44100Hz mono, 128kbps)
-            # supaya concat aman, sekaligus fix invalid header
-            > scene${sceneIdx}-voice-fixed.txt
-            i=0
-            for mp3 in "${VALID_MP3[@]}"; do
-              FIXED="voice/scene${sceneIdx}_fixed_$i.mp3"
+          # ===========================================================
+          # 3.1 Pre-process: re-encode all MP3 ke 44100Hz stereo 128k
+          # ===========================================================
+          mkdir -p voice/fixed
+          for mp3 in $(ls voice/*.mp3 2>/dev/null | grep -v "/fixed/"); do
+            DUR=$(ffprobe -v error -analyzeduration 5000000 -probesize 5000000 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp3" 2>/dev/null || echo "0")
+            VALID=$(echo "$DUR > 0.1" | bc 2>/dev/null || echo 0)
+            if [ "$VALID" = "1" ]; then
+              FIXED="voice/fixed/$(basename "$mp3")"
               ffmpeg -y -analyzeduration 5000000 -probesize 5000000 -i "$mp3" \
                 -ar 44100 -ac 2 -b:a 128k -c:a libmp3lame "$FIXED" 2>/dev/null && \
-                echo "file '$FIXED'" >> scene${sceneIdx}-voice-fixed.txt || \
-                echo "⚠️  Re-encode failed: $mp3"
-              i=$((i+1))
-            done
-
-            if [ ! -s scene${sceneIdx}-voice-fixed.txt ]; then
-              echo "⚠️  Scene $sceneIdx: all re-encodes failed, skip"
-              continue
-            fi
-
-            # Concat audio dari satu scene (pakai re-encoded files)
-            ffmpeg -y -f concat -safe 0 -i scene${sceneIdx}-voice-fixed.txt -c copy scene${sceneIdx}_audio.mp3 || \
-              ffmpeg -y -f concat -safe 0 -i scene${sceneIdx}-voice-fixed.txt -c:a libmp3lame -q:a 4 scene${sceneIdx}_audio.mp3
-
-            SCENE_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 scene${sceneIdx}_audio.mp3 || echo "3")
-            SCENE_DUR_INT=$(printf "%.0f" "$SCENE_DUR")
-            [ -z "$SCENE_DUR_INT" ] || [ "$SCENE_DUR_INT" -lt 2 ] && SCENE_DUR_INT=3
-
-            # Background image untuk scene ini
-            BG="images/scene${sceneIdx}_bg.png"
-            if [ ! -f "$BG" ]; then
-              # Fallback: pakai bg scene pertama yang ada
-              BG=$(ls images/scene*_bg.png 2>/dev/null | head -1)
-            fi
-
-            # Render slideshow per scene dengan Ken Burns zoompan
-            # Ken Burns: zoom dari 1.0 → 1.1 selama scene
-            FPS=30
-            TOTAL_FRAMES=$((SCENE_DUR_INT * FPS))
-            if [ -f "$BG" ]; then
-              ffmpeg -y -loop 1 -t $SCENE_DUR_INT -i "$BG" \
-                -vf "scale=8000:-1,zoompan=z='min(zoom+0.0015,1.15)':d=${TOTAL_FRAMES}:s=${W}x${H}:fps=${FPS},setsar=1" \
-                -c:v libx264 -pix_fmt yuv420p -preset fast -t $SCENE_DUR_INT scene${sceneIdx}_video.mp4
+                cp "$FIXED" "$mp3" || echo "Re-encode failed: $mp3"
             else
-              # Fallback solid color
-              ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=${SCENE_DUR_INT}:r=${FPS} \
-                -c:v libx264 -pix_fmt yuv420p scene${sceneIdx}_video.mp4
+              echo "⚠️  Removing corrupt MP3: $mp3 (dur=$DUR)"
+              rm -f "$mp3"
             fi
-
-            echo "file 'scene${sceneIdx}_video.mp4'" >> scene-list.txt
-            echo "Scene ${sceneIdx}: ${SCENE_DUR_INT}s, BG=$BG"
           done
 
-          # ----- Concat all scene videos -----
-          if [ -s scene-list.txt ]; then
-            ffmpeg -y -f concat -safe 0 -i scene-list.txt -c copy slideshow.mp4
-          else
-            echo "❌ No scenes generated"
-            ffmpeg -y -f lavfi -i color=c=0x7c3aed:s=${W}x${H}:d=15:r=30 -c:v libx264 -pix_fmt yuv420p slideshow.mp4
-          fi
+          # ===========================================================
+          # 3.2 Build TITLE CARD (3 detik intro)
+          # ===========================================================
+          # Solid gradient background + judul gede + channel handle
+          ffmpeg -y \
+            -f lavfi -i "gradients=size=${W}x${H}:duration=3:speed=0.05:c0=0x${BRAND_PRIMARY}:c1=0x${BRAND_SECONDARY}:c2=0x${BRAND_ACCENT}:r=${FPS}" \
+            -vf "drawtext=text='${TITLE}':fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=white:borderw=6:bordercolor=black\@0.5:x=(w-text_w)/2:y=(h-text_h)/2-60:line_spacing=15,
+                 drawtext=text='@${CHANNEL}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=white\@0.85:x=(w-text_w)/2:y=(h-text_h)/2+80,
+                 drawtext=text='${WEBSITE}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=white\@0.7:x=(w-text_w)/2:y=h-100" \
+            -t 3 -c:v libx264 -pix_fmt yuv420p -preset fast title_card.mp4
 
-          # ----- Concat all audio (scene order + cta paling akhir karena prefix zzz) -----
-          # Validate + re-encode dulu setiap mp3 supaya gak ada corrupt header
-          > voice-list-fixed.txt
-          i=0
-          for mp3 in $(ls voice/*.mp3 2>/dev/null | sort | grep -v "_fixed_"); do
-            DUR=$(ffprobe -v error -analyzeduration 5000000 -probesize 5000000 -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$mp3" 2>/dev/null || echo "0")
-            if [ -z "$DUR" ] || [ "$(echo "$DUR > 0.1" | bc 2>/dev/null || echo 0)" != "1" ]; then
-              echo "⚠️  Skip invalid mp3 in full concat: $mp3"
-              continue
+          # Silent audio untuk title card
+          ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 3 -q:a 9 -acodec libmp3lame title_card_audio.mp3
+
+          # ===========================================================
+          # 3.3 Render setiap DIALOG sebagai shot pendek
+          # ===========================================================
+          rm -f shots-list.txt
+          rm -f audio-list.txt
+          echo "file 'title_card.mp4'" >> shots-list.txt
+          echo "file 'title_card_audio.mp3'" >> audio-list.txt
+
+          # Loop semua scene di timeline
+          SCENE_COUNT=$(jq '.timeline | length' manifest.json)
+          echo "Total scenes: $SCENE_COUNT"
+
+          shotIdx=0
+          for sceneIdx in $(seq 0 $((SCENE_COUNT-1))); do
+            BG_FILE_NAME=$(jq -r ".timeline[${sceneIdx}].background_image // \"\"" manifest.json)
+            BG_PATH="images/${BG_FILE_NAME}"
+            if [ ! -f "$BG_PATH" ]; then
+              BG_PATH=$(ls images/scene*_bg.png 2>/dev/null | head -1)
             fi
-            FIXED="voice/full_fixed_$i.mp3"
-            ffmpeg -y -analyzeduration 5000000 -probesize 5000000 -i "$mp3" \
-              -ar 44100 -ac 2 -b:a 128k -c:a libmp3lame "$FIXED" 2>/dev/null && \
-              echo "file '$FIXED'" >> voice-list-fixed.txt
-            i=$((i+1))
+            DIALOG_COUNT=$(jq ".timeline[${sceneIdx}].dialogs | length" manifest.json)
+            echo "Scene $sceneIdx: BG=$BG_PATH dialogs=$DIALOG_COUNT"
+
+            for dIdx in $(seq 0 $((DIALOG_COUNT-1))); do
+              D=$(jq -c ".timeline[${sceneIdx}].dialogs[${dIdx}]" manifest.json)
+              CHAR=$(echo "$D" | jq -r '.character // "NYBEL"')
+              EMO=$(echo "$D" | jq -r '.emotion // "talking"')
+              POSE_FN=$(echo "$D" | jq -r '.pose_file // ""')
+              VOICE_FN=$(echo "$D" | jq -r '.voice_file // ""')
+              CAPTION=$(echo "$D" | jq -r '.caption // ""' | head -c 200 | sed "s/['\"\\\\:]//g")
+              WORD_COUNT=$(echo "$CAPTION" | wc -w)
+
+              VOICE_PATH="voice/${VOICE_FN}"
+              if [ ! -f "$VOICE_PATH" ]; then
+                echo "⚠️  No voice for shot ${shotIdx}, skip"
+                continue
+              fi
+              SHOT_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VOICE_PATH" 2>/dev/null || echo "3")
+              SHOT_DUR_INT=$(printf "%.0f" "$SHOT_DUR")
+              [ -z "$SHOT_DUR_INT" ] || [ "$SHOT_DUR_INT" -lt 2 ] && SHOT_DUR_INT=3
+
+              # ============================================================
+              # SHOT TYPE DECISION: explainer (full-body Nybel) atau talk shot
+              # ============================================================
+              SHOT_TYPE="talk"
+              # Hook scene 1 dialog 1 → explainer
+              if [ "$sceneIdx" = "0" ] && [ "$dIdx" = "0" ] && [ "$CHAR" = "NYBEL" ]; then
+                SHOT_TYPE="explainer"
+              fi
+              # NYBEL dialog panjang atau emosi explanatory → explainer
+              if [ "$CHAR" = "NYBEL" ] && [ "$WORD_COUNT" -ge 15 ]; then
+                SHOT_TYPE="explainer"
+              fi
+              if [ "$CHAR" = "NYBEL" ] && { [ "$EMO" = "pointing" ] || [ "$EMO" = "idea" ]; }; then
+                SHOT_TYPE="explainer"
+              fi
+              # NYBELIC selalu talk shot (karena dia chibi gak ada full-body)
+              if [ "$CHAR" = "NYBELIC" ]; then
+                SHOT_TYPE="talk"
+              fi
+              echo "Shot ${shotIdx}: TYPE=$SHOT_TYPE char=$CHAR emo=$EMO words=$WORD_COUNT"
+
+              # ============================================================
+              # Resolve karakter files berdasarkan shot type
+              # ============================================================
+              if [ "$SHOT_TYPE" = "explainer" ]; then
+                # Pilih full-body Nybel sesuai emosi
+                case "$EMO" in
+                  pointing) FULLBODY="characters/nybel-fullbody-pointing.png" ;;
+                  idea|talking|laughing|excited) FULLBODY="characters/nybel-fullbody-presenting.png" ;;
+                  *) FULLBODY="characters/nybel-fullbody-standing.png" ;;
+                esac
+                # Fallback chain
+                [ ! -f "$FULLBODY" ] && FULLBODY="characters/nybel-fullbody-standing.png"
+                [ ! -f "$FULLBODY" ] && FULLBODY="characters/nybel-fullbody-presenting.png"
+                [ ! -f "$FULLBODY" ] && FULLBODY="characters/nybel-fullbody-pointing.png"
+                # Kalau gak ada full-body sama sekali → fallback ke talk shot
+                if [ ! -f "$FULLBODY" ]; then
+                  echo "⚠️  No fullbody PNG, fallback to talk shot"
+                  SHOT_TYPE="talk"
+                fi
+              fi
+
+              if [ "$SHOT_TYPE" = "talk" ]; then
+                ACTIVE_POSE="characters/${POSE_FN}"
+                [ ! -f "$ACTIVE_POSE" ] && ACTIVE_POSE="characters/$(echo "$CHAR" | tr 'A-Z' 'a-z')-talking.png"
+                [ ! -f "$ACTIVE_POSE" ] && ACTIVE_POSE="characters/$(echo "$CHAR" | tr 'A-Z' 'a-z')-idle.png"
+                [ ! -f "$ACTIVE_POSE" ] && ACTIVE_POSE=$(ls characters/$(echo "$CHAR" | tr 'A-Z' 'a-z')-*.png 2>/dev/null | grep -v "fullbody" | head -1)
+
+                if [ "$CHAR" = "NYBEL" ]; then
+                  LISTENER_POSE="characters/nybelic-idle.png"
+                  [ ! -f "$LISTENER_POSE" ] && LISTENER_POSE=$(ls characters/nybelic-*.png 2>/dev/null | head -1)
+                  NAME_TAG="NYBEL — Penjelas"
+                else
+                  LISTENER_POSE="characters/nybel-idle.png"
+                  [ ! -f "$LISTENER_POSE" ] && LISTENER_POSE=$(ls characters/nybel-*.png 2>/dev/null | grep -v "fullbody" | head -1)
+                  NAME_TAG="NYBELIC — Sidekick"
+                fi
+              else
+                NAME_TAG="NYBEL — Penjelas"
+              fi
+
+              # ============================================================
+              # Background slideshow (Ken Burns) — selalu generate
+              # ============================================================
+              ZOOM_DIR=$((shotIdx % 4))
+              case $ZOOM_DIR in
+                0) PAN="x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'" ;;
+                1) PAN="x='0':y='0'" ;;
+                2) PAN="x='iw-iw/zoom':y='0'" ;;
+                3) PAN="x='iw/2-(iw/zoom/2)':y='ih-ih/zoom'" ;;
+              esac
+              TOTAL_FRAMES=$((SHOT_DUR_INT * FPS))
+
+              if [ -f "$BG_PATH" ]; then
+                ffmpeg -y -loop 1 -t $SHOT_DUR_INT -i "$BG_PATH" \
+                  -vf "scale=8000:-1,zoompan=z='min(zoom+0.0010,1.12)':${PAN}:d=${TOTAL_FRAMES}:s=${W}x${H}:fps=${FPS},setsar=1" \
+                  -c:v libx264 -pix_fmt yuv420p -preset fast -t $SHOT_DUR_INT shot_bg_${shotIdx}.mp4
+              else
+                ffmpeg -y -f lavfi \
+                  -i "gradients=size=${W}x${H}:duration=${SHOT_DUR_INT}:speed=0.04:c0=0x${BRAND_PRIMARY}:c1=0x${BRAND_SECONDARY}:c2=0x${BRAND_ACCENT}:r=${FPS}" \
+                  -t $SHOT_DUR_INT -c:v libx264 -pix_fmt yuv420p shot_bg_${shotIdx}.mp4
+              fi
+
+              # ============================================================
+              # RENDER SHOT — branch by SHOT_TYPE
+              # ============================================================
+              if [ "$SHOT_TYPE" = "explainer" ]; then
+                # Full-body Nybel KIRI 50% width, infografik bg KANAN tetap visible
+                # Bg di-shift ke kanan supaya gak ke-tutup karakter, atau pakai layout split
+                FB_W=$((W * 50 / 100))
+                FB_X=20  # margin kiri kecil
+                FB_BOB="0+5*sin(2*PI*t/2)"
+
+                # Top label "Penjelasan" + caption box bawah
+                FILTER="[1:v]scale=${FB_W}:-1[fb_raw];[fb_raw]format=rgba,colorchannelmixer=aa=1.0[fb];"
+                FILTER="${FILTER}[0:v][fb]overlay=x=${FB_X}:y='H-h+${FB_BOB}'[bg2];"
+                FILTER="${FILTER}[bg2]drawbox=x=0:y=H-${SUB_HEIGHT}:w=W:h=${SUB_HEIGHT}:color=black\@0.72:t=fill[boxed];"
+                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=H-${SUB_HEIGHT}+20[named];"
+                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=H-${SUB_HEIGHT}+80:line_spacing=12[v]"
+
+                ffmpeg -y \
+                  -i shot_bg_${shotIdx}.mp4 \
+                  -loop 1 -t $SHOT_DUR_INT -i "$FULLBODY" \
+                  -i "$VOICE_PATH" \
+                  -filter_complex "$FILTER" \
+                  -map "[v]" -map 2:a \
+                  -c:v libx264 -pix_fmt yuv420p -preset fast \
+                  -c:a aac -b:a 128k \
+                  -t $SHOT_DUR_INT \
+                  shot_${shotIdx}.mp4
+
+              else
+                # TALK SHOT (existing): portrait Nybel + Nybelic chibi side-by-side
+                CHAR_W=$((W * CHAR_W_PCT / 100))
+                if [ "$CHAR" = "NYBEL" ]; then
+                  ACTIVE_X="40"; LISTENER_X="W-w-40"
+                else
+                  ACTIVE_X="W-w-40"; LISTENER_X="40"
+                fi
+                ACTIVE_Y_EXPR="H-h-${SUB_HEIGHT}-30"
+                LISTENER_Y_EXPR="H-h-${SUB_HEIGHT}-30"
+                ACTIVE_BOB="0+8*sin(2*PI*t/0.5)"
+                LISTENER_BOB="0+3*sin(2*PI*t/2)"
+
+                FILTER="[1:v]scale=${CHAR_W}:-1[active_raw];[active_raw]format=rgba,colorchannelmixer=aa=1.0[active];"
+                FILTER="${FILTER}[2:v]scale=${CHAR_W}:-1[lst_raw];[lst_raw]format=rgba,colorchannelmixer=aa=0.55[listener];"
+                FILTER="${FILTER}[0:v][listener]overlay=x=${LISTENER_X}:y='${LISTENER_Y_EXPR}+${LISTENER_BOB}'[bg1];"
+                FILTER="${FILTER}[bg1][active]overlay=x=${ACTIVE_X}:y='${ACTIVE_Y_EXPR}+${ACTIVE_BOB}'[bg2];"
+                FILTER="${FILTER}[bg2]drawbox=x=0:y=H-${SUB_HEIGHT}:w=W:h=${SUB_HEIGHT}:color=black\@0.72:t=fill[boxed];"
+                FILTER="${FILTER}[boxed]drawtext=text='${NAME_TAG}':fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=H-${SUB_HEIGHT}+20[named];"
+                FILTER="${FILTER}[named]drawtext=text='${CAPTION}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=H-${SUB_HEIGHT}+80:line_spacing=12[v]"
+
+                ffmpeg -y \
+                  -i shot_bg_${shotIdx}.mp4 \
+                  -loop 1 -t $SHOT_DUR_INT -i "$ACTIVE_POSE" \
+                  -loop 1 -t $SHOT_DUR_INT -i "$LISTENER_POSE" \
+                  -i "$VOICE_PATH" \
+                  -filter_complex "$FILTER" \
+                  -map "[v]" -map 3:a \
+                  -c:v libx264 -pix_fmt yuv420p -preset fast \
+                  -c:a aac -b:a 128k \
+                  -t $SHOT_DUR_INT \
+                  shot_${shotIdx}.mp4
+              fi
+
+              ffmpeg -y -i shot_${shotIdx}.mp4 -vn -ar 44100 -ac 2 -b:a 128k -c:a libmp3lame shot_${shotIdx}.mp3 2>/dev/null
+
+              echo "file 'shot_${shotIdx}.mp4'" >> shots-list.txt
+              echo "file 'shot_${shotIdx}.mp3'" >> audio-list.txt
+              echo "✅ Shot ${shotIdx} (${SHOT_TYPE}): scene=${sceneIdx} dialog=${dIdx} char=${CHAR} emotion=${EMO} dur=${SHOT_DUR_INT}s"
+              shotIdx=$((shotIdx+1))
+            done
           done
 
-          if [ -s voice-list-fixed.txt ]; then
-            ffmpeg -y -f concat -safe 0 -i voice-list-fixed.txt -c copy full_audio.mp3 || \
-              ffmpeg -y -f concat -safe 0 -i voice-list-fixed.txt -c:a libmp3lame -q:a 4 full_audio.mp3
+          # ===========================================================
+          # 3.4 CTA OUTRO CARD (5 detik akhir)
+          # ===========================================================
+          CTA_TEXT=$(jq -r '.cta_text // "Cek psikotes di nybelic.com"' manifest.json | head -c 200 | sed "s/['\"\\\\:]//g")
+          CTA_VOICE="voice/zzz_cta_nybel.mp3"
+
+          if [ -f "$CTA_VOICE" ]; then
+            CTA_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$CTA_VOICE" 2>/dev/null || echo "5")
+            CTA_DUR_INT=$(printf "%.0f" "$CTA_DUR")
+            [ -z "$CTA_DUR_INT" ] || [ "$CTA_DUR_INT" -lt 3 ] && CTA_DUR_INT=5
           else
-            ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 15 -q:a 9 -acodec libmp3lame full_audio.mp3
+            CTA_DUR_INT=5
+            ffmpeg -y -f lavfi -i anullsrc=r=44100:cl=stereo -t 5 -q:a 9 -acodec libmp3lame "$CTA_VOICE" 2>/dev/null
           fi
 
-          DURATION=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 full_audio.mp3 || echo "0")
-          DURATION_INT=$(printf "%.0f" "$DURATION")
-          [ -z "$DURATION_INT" ] || [ "$DURATION_INT" -lt 15 ] && DURATION_INT=15
-          echo "Total audio duration: ${DURATION_INT}s"
+          NYBEL_POINTING="characters/nybel-pointing.png"
+          [ ! -f "$NYBEL_POINTING" ] && NYBEL_POINTING="characters/nybel-talking.png"
+          [ ! -f "$NYBEL_POINTING" ] && NYBEL_POINTING=$(ls characters/nybel-*.png 2>/dev/null | head -1)
+          NYBELIC_EXC="characters/nybelic-excited.png"
+          [ ! -f "$NYBELIC_EXC" ] && NYBELIC_EXC=$(ls characters/nybelic-*.png 2>/dev/null | head -1)
 
-          # ----- Pick character files -----
-          NYBEL_FILE="characters/nybel-talking.png"
-          [ ! -f "$NYBEL_FILE" ] && NYBEL_FILE="characters/nybel-idle.png"
-          [ ! -f "$NYBEL_FILE" ] && NYBEL_FILE=$(ls characters/nybel-*.png 2>/dev/null | head -1)
+          # CTA card: gradient + judul "Cek Psikotes" + URL gede + dua karakter pointing
+          CHAR_W=$((W * CHAR_W_PCT / 100))
+          ffmpeg -y \
+            -f lavfi -i "gradients=size=${W}x${H}:duration=${CTA_DUR_INT}:speed=0.06:c0=0x${BRAND_PRIMARY}:c1=0x${BRAND_SECONDARY}:c2=0x${BRAND_ACCENT}:r=${FPS}" \
+            -loop 1 -t $CTA_DUR_INT -i "$NYBEL_POINTING" \
+            -loop 1 -t $CTA_DUR_INT -i "$NYBELIC_EXC" \
+            -i "$CTA_VOICE" \
+            -filter_complex "[1:v]scale=${CHAR_W}:-1[n1];[2:v]scale=${CHAR_W}:-1[n2];[0:v][n1]overlay=x=40:y='H-h-30+8*sin(2*PI*t/0.5)'[a1];[a1][n2]overlay=x='W-w-40':y='H-h-30+8*sin(2*PI*t/0.5+1)'[a2];[a2]drawtext=text='Cek Psikotes Anda Sekarang':fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=white:borderw=5:bordercolor=black\@0.6:x=(w-text_w)/2:y=120,drawtext=text='${WEBSITE}':fontfile='${FONT_PATH}':fontsize=${FONT_BIG}:fontcolor=0x${BRAND_ACCENT}:borderw=5:bordercolor=white\@0.8:x=(w-text_w)/2:y=240,drawtext=text='${CTA_TEXT}':fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:borderw=3:bordercolor=black\@0.5:x=(w-text_w)/2:y=380:line_spacing=12[v]" \
+            -map "[v]" -map 3:a \
+            -c:v libx264 -pix_fmt yuv420p -preset fast \
+            -c:a aac -b:a 128k \
+            -t $CTA_DUR_INT \
+            cta_card.mp4
 
-          NYBELIC_FILE="characters/nybelic-talking.png"
-          [ ! -f "$NYBELIC_FILE" ] && NYBELIC_FILE="characters/nybelic-idle.png"
-          [ ! -f "$NYBELIC_FILE" ] && NYBELIC_FILE=$(ls characters/nybelic-*.png 2>/dev/null | head -1)
+          ffmpeg -y -i cta_card.mp4 -vn -ar 44100 -ac 2 -b:a 128k -c:a libmp3lame cta_card.mp3 2>/dev/null
+          echo "file 'cta_card.mp4'" >> shots-list.txt
+          echo "file 'cta_card.mp3'" >> audio-list.txt
 
-          echo "Nybel = $NYBEL_FILE"
-          echo "Nybelic = $NYBELIC_FILE"
+          # ===========================================================
+          # 3.5 CONCAT semua shots ke video final
+          # ===========================================================
+          ffmpeg -y -f concat -safe 0 -i shots-list.txt -c copy final_video.mp4 || \
+            ffmpeg -y -f concat -safe 0 -i shots-list.txt -c:v libx264 -c:a aac final_video.mp4
 
-          # ----- Layout integer math -----
-          if [ "$FORMAT" = "long" ]; then
-            H_NYBEL=$((H * 35 / 100))
-            H_NYBELIC=$((H * 30 / 100))
-            NYBEL_X=60
-            NYBEL_Y_OFFSET=40
-            NYBELIC_X_OFFSET=60
-            NYBELIC_Y_OFFSET=40
-            FONT_SIZE=56
+          # ===========================================================
+          # 3.6 Mix audio + background music (-25dB ducking)
+          # ===========================================================
+          BGM="music/bgm.mp3"
+          if [ -f "$BGM" ]; then
+            FINAL_DUR=$(ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 final_video.mp4)
+            FINAL_DUR_INT=$(printf "%.0f" "$FINAL_DUR")
+            ffmpeg -y -stream_loop -1 -i "$BGM" -t $FINAL_DUR_INT -af "volume=-25dB" bgm_loop.mp3
+            ffmpeg -y -i final_video.mp4 -i bgm_loop.mp3 \
+              -filter_complex "[0:a][1:a]amix=inputs=2:duration=first:dropout_transition=2[aout]" \
+              -map 0:v -map "[aout]" \
+              -c:v copy -c:a aac -b:a 192k \
+              "../../output/${JOB_ID}.mp4"
           else
-            H_NYBEL=$((H * 45 / 100))
-            H_NYBELIC=$((H * 38 / 100))
-            NYBEL_X=40
-            NYBEL_Y_OFFSET=60
-            NYBELIC_X_OFFSET=40
-            NYBELIC_Y_OFFSET=60
-            FONT_SIZE=72
-          fi
-          echo "Layout: H_NYBEL=$H_NYBEL H_NYBELIC=$H_NYBELIC"
-
-          # ----- Title sanitize -----
-          TITLE=$(jq -r '.title // "Nybelic"' manifest.json 2>/dev/null | head -c 60 | sed "s/['\"\\\\:]//g")
-          [ -z "$TITLE" ] && TITLE="Nybelic"
-          echo "Title: $TITLE"
-
-          # ----- Add subtle bobbing animation pada karakter (sin wave 0-2px tiap detik) -----
-          # Karakter "ngangguk" pelan supaya gak terlihat static
-          NYBEL_BOB="0+5*sin(2*PI*t/2)"
-          NYBELIC_BOB="0+5*sin(2*PI*t/1.5+1)"
-
-          # ----- Final render with character overlay + bobbing animation -----
-          if [ -f "$NYBEL_FILE" ] && [ -f "$NYBELIC_FILE" ]; then
-            echo "Rendering with both characters + Ken Burns + bobbing"
-            FILTER="[1:v]scale=-1:${H_NYBEL}[nybel];"
-            FILTER="${FILTER}[2:v]scale=-1:${H_NYBELIC}[nybelic];"
-            FILTER="${FILTER}[0:v][nybel]overlay=x=${NYBEL_X}:y='H-h-${NYBEL_Y_OFFSET}+${NYBEL_BOB}':shortest=0[bg1];"
-            FILTER="${FILTER}[bg1][nybelic]overlay=x='W-w-${NYBELIC_X_OFFSET}':y='H-h-${NYBELIC_Y_OFFSET}+${NYBELIC_BOB}':shortest=0,"
-            FILTER="${FILTER}drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]"
-
-            ffmpeg -y \
-              -i slideshow.mp4 \
-              -loop 1 -t $DURATION_INT -i "$NYBEL_FILE" \
-              -loop 1 -t $DURATION_INT -i "$NYBELIC_FILE" \
-              -i full_audio.mp3 \
-              -filter_complex "$FILTER" \
-              -map "[v]" -map 3:a \
-              -c:v libx264 -pix_fmt yuv420p -preset fast \
-              -c:a aac -b:a 192k \
-              -t $DURATION_INT \
-              "../../output/${JOB_ID}.mp4"
-
-          elif [ -f "$NYBEL_FILE" ]; then
-            echo "Rendering with NYBEL only"
-            FILTER="[1:v]scale=-1:${H_NYBEL}[nybel];"
-            FILTER="${FILTER}[0:v][nybel]overlay=x=${NYBEL_X}:y='H-h-${NYBEL_Y_OFFSET}+${NYBEL_BOB}':shortest=0,"
-            FILTER="${FILTER}drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]"
-
-            ffmpeg -y \
-              -i slideshow.mp4 \
-              -loop 1 -t $DURATION_INT -i "$NYBEL_FILE" \
-              -i full_audio.mp3 \
-              -filter_complex "$FILTER" \
-              -map "[v]" -map 2:a \
-              -c:v libx264 -pix_fmt yuv420p -preset fast \
-              -c:a aac -b:a 192k \
-              -t $DURATION_INT \
-              "../../output/${JOB_ID}.mp4"
-
-          else
-            echo "Rendering slideshow only"
-            ffmpeg -y \
-              -i slideshow.mp4 \
-              -i full_audio.mp3 \
-              -filter_complex "[0:v]drawtext=text='${TITLE}':fontsize=${FONT_SIZE}:fontcolor=white:borderw=4:bordercolor=black:x=(w-text_w)/2:y=80:enable='between(t,0,3)'[v]" \
-              -map "[v]" -map 1:a \
-              -c:v libx264 -pix_fmt yuv420p -preset fast \
-              -c:a aac -b:a 192k \
-              -t $DURATION_INT \
-              "../../output/${JOB_ID}.mp4"
+            cp final_video.mp4 "../../output/${JOB_ID}.mp4"
           fi
 
           ls -la "../../output/"
           ffprobe -v error -show_entries format=duration,size -of default=noprint_wrappers=1 "../../output/${JOB_ID}.mp4" || true
-          echo "✅ Render complete"
+          echo "✅ Render complete (Kok-Bisa style)"
 
-      # ---------------------------------------------------------------
-      # 4. UPLOAD TO HOSTINGER (optional)
-      # ---------------------------------------------------------------
+      # ===========================================================
+      # 4. UPLOAD TO HOSTINGER (FTP optional)
+      # ===========================================================
       - name: Upload to Hostinger via FTP
         env:
           FTP_HOST: ${{ secrets.HOSTINGER_FTP_HOST }}
@@ -331,9 +429,9 @@ jobs:
             echo "⏭️  FTP secrets not configured, skip upload"
           fi
 
-      # ---------------------------------------------------------------
-      # 5. ARTIFACT
-      # ---------------------------------------------------------------
+      # ===========================================================
+      # 5. ARTIFACT (always)
+      # ===========================================================
       - name: Upload as GitHub artifact
         uses: actions/upload-artifact@v4
         with:
@@ -341,9 +439,9 @@ jobs:
           path: output/*.mp4
           retention-days: 7
 
-      # ---------------------------------------------------------------
+      # ===========================================================
       # 6. CALLBACK
-      # ---------------------------------------------------------------
+      # ===========================================================
       - name: Notify Hostinger callback
         if: always()
         env:
