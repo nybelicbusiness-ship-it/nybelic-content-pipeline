@@ -273,7 +273,7 @@ jobs:
 
               if [ -f "$BG_PATH" ]; then
                 ffmpeg -y -loop 1 -t $SHOT_DUR_INT -i "$BG_PATH" \
-                  -vf "scale=8000:-1,zoompan=z='min(zoom+0.0010,1.12)':${PAN}:d=${TOTAL_FRAMES}:s=${W}x${H}:fps=${FPS},setsar=1" \
+                  -vf "scale=8000:-1,zoompan=z='min(zoom+0.0010,1.12)':${PAN}:d=${TOTAL_FRAMES}:s=${W}x${H}:fps=${FPS},setsar=1,eq=brightness=-0.08:saturation=0.85,boxblur=2:1" \
                   -c:v libx264 -pix_fmt yuv420p -preset fast -t $SHOT_DUR_INT shot_bg_${shotIdx}.mp4
               else
                 ffmpeg -y -f lavfi \
@@ -285,22 +285,26 @@ jobs:
               # RENDER SHOT — branch by SHOT_TYPE
               # ============================================================
               if [ "$SHOT_TYPE" = "explainer" ]; then
-                # Full-body Nybel KIRI 50% width, infografik bg KANAN tetap visible
-                FB_W=$((W * 50 / 100))
+                # Full-body Nybel KIRI 40% width (lebih kecil supaya bg masih kelihatan)
+                # Posisi LEBIH RENDAH supaya tidak overlap caption box
+                FB_W=$((W * 40 / 100))
                 FB_X=20
                 FB_BOB="0+5*sin(2*PI*t/2)"
 
-                # Pre-calculate Y positions di shell (drawbox & drawtext gak pakai W/H literal)
+                # Pre-calculate Y positions di shell
                 BOX_Y=$((H - SUB_HEIGHT))
                 CAP_Y=$((H - SUB_HEIGHT + 80))
                 NAME_Y=$((H - SUB_HEIGHT + 20))
+                # Karakter full-body posisinya HARUS di atas caption box, tidak overlap
+                # H - SUB_HEIGHT - karakter_height
+                FB_Y_OFFSET=$((SUB_HEIGHT + 20))
 
-                # Save caption + name tag ke file (avoid shell-escape hell)
+                # Save caption + name tag ke file
                 printf '%s' "$CAPTION" > caption_${shotIdx}.txt
                 printf '%s' "$NAME_TAG" > nametag_${shotIdx}.txt
 
                 FILTER="[1:v]scale=${FB_W}:-1[fb_raw];[fb_raw]format=rgba,colorchannelmixer=aa=1.0[fb];"
-                FILTER="${FILTER}[0:v][fb]overlay=x=${FB_X}:y='H-h+${FB_BOB}'[bg2];"
+                FILTER="${FILTER}[0:v][fb]overlay=x=${FB_X}:y='H-h-${FB_Y_OFFSET}+${FB_BOB}'[bg2];"
                 FILTER="${FILTER}[bg2]drawbox=x=0:y=${BOX_Y}:w=iw:h=${SUB_HEIGHT}:color=black@0.72:t=fill[boxed];"
                 FILTER="${FILTER}[boxed]drawtext=textfile=nametag_${shotIdx}.txt:fontfile='${FONT_PATH}':fontsize=${FONT_NAME}:fontcolor=0x${BRAND_ACCENT}:x=40:y=${NAME_Y}[named];"
                 FILTER="${FILTER}[named]drawtext=textfile=caption_${shotIdx}.txt:fontfile='${FONT_PATH}':fontsize=${FONT_CAP}:fontcolor=white:x=(w-text_w)/2:y=${CAP_Y}:line_spacing=12[v]"
